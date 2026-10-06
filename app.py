@@ -206,8 +206,7 @@ def refresh_products():
         return len(products)
     except Exception as e:
         with state_lock:
-            knowledge["last_error"] = f"Firebase product load error: {type(e).__name__}: {e}"
-        app.logger.error("Firebase product load failed: %s", e)
+            knowledge["last_error"] = f"Firebase product load error: {e}"
         return 0
 
 
@@ -395,6 +394,15 @@ def home():
 
 @app.get("/health")
 def health():
+    # If the background refresh has not populated products yet, load them
+    # synchronously once. This avoids reporting 0 after a successful Firebase
+    # connection just because the background thread has not completed.
+    with state_lock:
+        needs_products = len(knowledge["products"]) == 0
+
+    if needs_products:
+        refresh_products()
+
     with state_lock:
         return jsonify({
             "ok": True,
@@ -408,35 +416,6 @@ def health():
             "facebook_last_refresh": knowledge["facebook_last_refresh"],
             "last_error": knowledge["last_error"],
         })
-
-
-@app.get("/firebase-test")
-def firebase_test():
-    """Safe diagnostic for the public Firebase products endpoint."""
-    url = f"{FIREBASE_DATABASE_URL}/products.json"
-    try:
-        r = requests.get(url, timeout=(5, 15))
-        preview = r.text[:300].replace("\n", " ")
-        count = 0
-        if r.ok:
-            data = r.json() or {}
-            if isinstance(data, dict):
-                count = len(data)
-            elif isinstance(data, list):
-                count = len(data)
-        return jsonify({
-            "ok": r.ok,
-            "firebase_url": url,
-            "http_status": r.status_code,
-            "products_found": count,
-            "response_preview": preview,
-        }), (200 if r.ok else 502)
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "firebase_url": url,
-            "error": f"{type(e).__name__}: {e}",
-        }), 502
 
 
 @app.get("/refresh")
@@ -455,9 +434,17 @@ def test_chat():
     q = request.args.get("q", "").strip()
     if not q:
         q = "হ্যালো"
+
+    with state_lock:
+        needs_products = len(knowledge["products"]) == 0
+
+    if needs_products:
+        refresh_products()
+
     return jsonify({
         "ok": True,
         "question": q,
+        "products_loaded": len(knowledge["products"]),
         "answer": ask_gemini(q)
     })
 
