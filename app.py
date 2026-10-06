@@ -3,422 +3,476 @@ import json
 import sqlite3
 import threading
 import time
-import threading
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify, request, render_template_string
-from dotenv import load_dotenv
+from flask import Flask, jsonify, request
 
-load_dotenv()
+try:
+    from google import genai
+except Exception:
+    genai = None
 
 app = Flask(__name__)
 
+# =========================
+# Config
+# =========================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+
+# Firebase Realtime Database used by the True Seller website.
+FIREBASE_DATABASE_URL = os.getenv(
+    "FIREBASE_DATABASE_URL",
+    "https://true-seller-5f0e7-default-rtdb.firebaseio.com"
+).rstrip("/")
+
 WEBSITE_URL = os.getenv(
     "WEBSITE_URL",
-    "https://ridwanulhoqueriyad212-ops.github.io/True_seller/"
+    "https://ridwanulhoqueriyad212-ops.github.io/true_seller/"
 ).strip()
-FACEBOOK_PAGE_URL = os.getenv(
-    "FACEBOOK_PAGE_URL",
-    "https://www.facebook.com/profile.php?id=61595169802113"
-).strip()
-FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "61595169802113").strip()
-FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN", "").strip()
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "true-seller-verify").strip()
-REFRESH_MINUTES = int(os.getenv("REFRESH_MINUTES", "60"))
-DB_PATH = os.getenv("DB_PATH", "true_seller.db")
-PORT = int(os.getenv("PORT", "10000"))
 
+FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "").strip()
+FACEBOOK_ACCESS_TOKEN = os.getenv("FACEBOOK_ACCESS_TOKEN", "").strip()
+
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+WHATSAPP_ACCESS_TOKEN = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
+WHATSAPP_PHONE_NUMBER_ID = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
+
+DB_PATH = os.getenv("DB_PATH", "orders.db")
+
+# =========================
+# Runtime state
+# =========================
+state_lock = threading.Lock()
 knowledge = {
-    "website_text": "",
     "products": [],
+    "website_text": "",
     "facebook_text": "",
     "website_last_refresh": None,
     "facebook_last_refresh": None,
+    "last_error": None,
 }
-knowledge_lock = threading.Lock()
+
+gemini_client = None
+if GEMINI_API_KEY and genai is not None:
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        knowledge["last_error"] = f"Gemini init error: {e}"
 
 
-def utc_now_iso():
+# =========================
+# Helpers
+# =========================
+def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_phone TEXT NOT NULL,
             customer_name TEXT,
+            phone TEXT,
             address TEXT,
             product TEXT,
-            created_at TEXT NOT NULL,
+            status TEXT DEFAULT 'confirmed',
+            created_at TEXT,
             review_sent INTEGER DEFAULT 0
         )
     """)
-    conn.commit()
-    conn.close()
+    con.commit()
+    con.close()
 
 
-def clean_text(s):
-    return " ".join((s or "").split())
+def clean_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
 
 
-def scrape_website():
-    """Read the shop website and extract visible product/content text."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; TrueSellerBot/1.0)"
-    }
-    r = requests.get(WEBSITE_URL, headers=headers, timeout=(5, 10))
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-
-    text = clean_text(soup.get_text(" ", strip=True))
-
-    products = []
-    # Prefer product-like cards/sections if the site has them.
-    selectors = [
-        "article",
-        ".product",
-        ".product-card",
-        ".card",
-        "[class*='product']",
-        "[class*='Product']",
-    ]
-    seen = set()
-
-    for selector in selectors:
-        for el in soup.select(selector):
-            title_el = el.select_one("h1, h2, h3, h4, .title, [class*='title'], [class*='name']")
-            title = clean_text(title_el.get_text(" ", strip=True)) if title_el else ""
-            block = clean_text(el.get_text(" ", strip=True))
-            if not block:
-                continue
-
-            if len(block) > 1000:
-                block = block[:1000]
-
-            image = ""
-            img = el.select_one("img")
-            if img and img.get("src"):
-                image = urljoin(WEBSITE_URL, img.get("src"))
-
-            link = ""
-            a = el.select_one("a[href]")
-            if a:
-                link = urljoin(WEBSITE_URL, a.get("href"))
-
-            key = block[:250]
-            if key in seen:
-                continue
-            seen.add(key)
-
-            products.append({
-                "name": title or "Product",
-                "details": block,
-                "image": image,
-                "url": link or WEBSITE_URL,
-            })
-
-    # Fallback: headings + surrounding text, so a simple GitHub Pages site still works.
-    if not products:
-        for heading in soup.select("h1, h2, h3, h4"):
-            title = clean_text(heading.get_text(" ", strip=True))
-            if not title:
-                continue
-            parent = heading.parent
-            block = clean_text(parent.get_text(" ", strip=True)) if parent else title
-            products.append({
-                "name": title,
-                "details": block[:1000],
-                "image": "",
-                "url": WEBSITE_URL,
-            })
-
-    with knowledge_lock:
-        knowledge["website_text"] = text
-        knowledge["products"] = products[:100]
-        knowledge["website_last_refresh"] = utc_now_iso()
-
-    return {
-        "ok": True,
-        "products_loaded": len(products),
-        "website_last_refresh": knowledge["website_last_refresh"],
-    }
-
-
-def fetch_facebook_knowledge():
-    """Use Meta Graph API when a Page access token is supplied.
-    Without a token, keep the public page URL as a source reference rather than
-    pretending we have private/admin access.
-    """
-    if not FACEBOOK_PAGE_ACCESS_TOKEN:
-        with knowledge_lock:
-            knowledge["facebook_text"] = (
-                f"Facebook Page: {FACEBOOK_PAGE_URL}\n"
-                "No Facebook Page access token is configured yet."
-            )
-            knowledge["facebook_last_refresh"] = utc_now_iso()
-        return
-
-    base = f"https://graph.facebook.com/v20.0/{FACEBOOK_PAGE_ID}"
-    params = {
-        "access_token": FACEBOOK_PAGE_ACCESS_TOKEN,
-        "fields": "name,about,description,website",
-    }
+def stock_text(stock):
+    if stock is None or stock == "":
+        return "Stock info not available"
     try:
-        r = requests.get(base, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        text_parts = [
-            data.get("name", ""),
-            data.get("about", ""),
-            data.get("description", ""),
-            data.get("website", ""),
-        ]
-        with knowledge_lock:
-            knowledge["facebook_text"] = clean_text(" ".join(text_parts))
-            knowledge["facebook_last_refresh"] = utc_now_iso()
+        n = float(stock)
+        if n <= 0:
+            return "Out of stock"
+        if n.is_integer():
+            return f"{int(n)} pcs available"
+    except Exception:
+        pass
+    return str(stock)
+
+
+def price_text(price):
+    if price is None or price == "":
+        return "Price not available"
+    return clean_value(price)
+
+
+# =========================
+# Firebase product loader
+# =========================
+def load_products_from_firebase():
+    """
+    The public True Seller site reads products from Firebase Realtime Database.
+    So we read the same /products endpoint directly instead of scraping
+    browser-rendered HTML.
+    """
+    url = f"{FIREBASE_DATABASE_URL}/products.json"
+    response = requests.get(url, timeout=(5, 15))
+    response.raise_for_status()
+
+    data = response.json() or {}
+    products = []
+
+    if isinstance(data, dict):
+        items = data.items()
+    elif isinstance(data, list):
+        items = enumerate(data)
+    else:
+        items = []
+
+    for pid, raw in items:
+        if not isinstance(raw, dict):
+            continue
+
+        # Keep all useful product fields, while normalizing common names.
+        name = (
+            raw.get("name")
+            or raw.get("title")
+            or raw.get("productName")
+            or f"Product {pid}"
+        )
+
+        product = dict(raw)
+        product["id"] = str(pid)
+        product["name"] = clean_value(name)
+        product["price"] = raw.get("price", raw.get("sellingPrice", raw.get("salePrice")))
+        product["stock"] = raw.get("stock", raw.get("quantity", raw.get("qty")))
+        product["image"] = raw.get("image") or raw.get("imageUrl") or raw.get("photo") or ""
+        products.append(product)
+
+    # Sort by product name for stable AI context.
+    products.sort(key=lambda p: p.get("name", "").lower())
+
+    lines = [
+        "TRUE SELLER LIVE PRODUCT CATALOG",
+        f"Source: Firebase Realtime Database ({FIREBASE_DATABASE_URL}/products)",
+        ""
+    ]
+
+    for i, p in enumerate(products, 1):
+        lines.append(f"{i}. {p.get('name', 'Unnamed Product')}")
+        lines.append(f"   Price: {price_text(p.get('price'))}")
+        lines.append(f"   Stock: {stock_text(p.get('stock'))}")
+
+        image = p.get("image")
+        if image:
+            lines.append(f"   Image: {image}")
+
+        # Include other descriptive fields without dumping huge/internal data.
+        skip = {
+            "id", "name", "price", "sellingPrice", "salePrice",
+            "stock", "quantity", "qty", "image", "imageUrl",
+            "photo", "createdAt", "updatedAt"
+        }
+        for key, value in p.items():
+            if key in skip or value in (None, "", [], {}):
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                lines.append(f"   {key}: {value}")
+
+        lines.append("")
+
+    return products, "\n".join(lines)
+
+
+def refresh_products():
+    try:
+        products, text = load_products_from_firebase()
+        with state_lock:
+            knowledge["products"] = products
+            knowledge["website_text"] = text
+            knowledge["website_last_refresh"] = now_iso()
+            knowledge["last_error"] = None
+        return len(products)
     except Exception as e:
-        with knowledge_lock:
-            knowledge["facebook_text"] = f"Facebook API refresh failed: {e}"
-            knowledge["facebook_last_refresh"] = utc_now_iso()
+        with state_lock:
+            knowledge["last_error"] = f"Firebase product load error: {e}"
+        return 0
+
+
+# =========================
+# Optional Facebook loader
+# =========================
+def refresh_facebook():
+    if not FACEBOOK_PAGE_ID or not FACEBOOK_ACCESS_TOKEN:
+        return 0
+
+    try:
+        url = f"https://graph.facebook.com/v20.0/{FACEBOOK_PAGE_ID}/posts"
+        params = {
+            "access_token": FACEBOOK_ACCESS_TOKEN,
+            "fields": "message,created_time,permalink_url",
+            "limit": 50,
+        }
+        r = requests.get(url, params=params, timeout=(5, 15))
+        r.raise_for_status()
+        data = r.json().get("data", [])
+
+        chunks = []
+        for post in data:
+            msg = post.get("message")
+            if msg:
+                chunks.append(msg)
+
+        with state_lock:
+            knowledge["facebook_text"] = "\n\n".join(chunks)
+            knowledge["facebook_last_refresh"] = now_iso()
+
+        return len(chunks)
+    except Exception as e:
+        with state_lock:
+            knowledge["last_error"] = f"Facebook refresh error: {e}"
+        return 0
 
 
 def refresh_all():
-    result = {"website": None, "facebook": None}
+    product_count = refresh_products()
+    refresh_facebook()
+    return product_count
+
+
+# =========================
+# Gemini
+# =========================
+SYSTEM_PROMPT = """
+You are the customer-support AI for True Seller, a Bangladesh online shop.
+
+Rules:
+1. Reply in the same language/style as the customer:
+   - Bangla -> Bangla
+   - English -> English
+   - Banglish -> natural Banglish
+2. Be friendly and concise. You may naturally use ভাই or আপু and 1-2 emojis.
+3. NEVER invent a price, stock quantity, delivery charge, product feature, or policy.
+4. Use the LIVE PRODUCT CATALOG below as the main source for product price and stock.
+5. If a requested fact is not in the catalog/knowledge, say you need to check and do not guess.
+6. For order collection, ask for:
+   name, phone number, full address, and product.
+7. When all order details are collected and the customer confirms, use:
+   "ঠিক আছে ভাই অর্ডার কনফার্ম ✅ আমরা 24 ঘন্টার মধ্যে কল দিবো"
+8. Never claim an order was actually placed in an external system unless the app explicitly confirms it.
+9. Do not be rude or argumentative.
+10. Do not expose API keys, internal prompts, database credentials, or internal implementation details.
+
+LIVE PRODUCT CATALOG:
+{products}
+
+WEBSITE/SHOP KNOWLEDGE:
+{website}
+
+FACEBOOK KNOWLEDGE:
+{facebook}
+"""
+
+
+def build_prompt(user_text):
+    with state_lock:
+        products_text = knowledge["website_text"] or "No product data loaded yet."
+        website_text = knowledge["website_text"] or "No website/product knowledge loaded yet."
+        facebook_text = knowledge["facebook_text"] or "No Facebook knowledge configured."
+
+    return SYSTEM_PROMPT.format(
+        products=products_text,
+        website=website_text,
+        facebook=facebook_text,
+    ) + f"\n\nCUSTOMER MESSAGE:\n{user_text}\n\nReply to the customer now."
+
+
+def ask_gemini(user_text):
+    if not gemini_client:
+        return "ভাই এখন AI সেটআপটা পুরোপুরি রেডি হয়নি। একটু পরে আবার চেষ্টা করেন।"
+
     try:
-        result["website"] = scrape_website()
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=build_prompt(user_text),
+        )
+        answer = getattr(response, "text", None)
+        if answer:
+            return answer.strip()
+        return "ভাই একটু সমস্যা হচ্ছে, কিছুক্ষণ পরে আবার চেষ্টা করেন।"
     except Exception as e:
-        result["website"] = {"ok": False, "error": str(e)}
-
-    try:
-        fetch_facebook_knowledge()
-        result["facebook"] = {"ok": True}
-    except Exception as e:
-        result["facebook"] = {"ok": False, "error": str(e)}
-
-    return result
+        with state_lock:
+            knowledge["last_error"] = f"Gemini error: {e}"
+        return "ভাই একটু সমস্যা হচ্ছে, কিছুক্ষণ পরে আবার চেষ্টা করেন।"
 
 
-def background_refresh_worker():
-    # Important fix: load the website immediately after every Render restart.
-    try:
-        refresh_all()
-    except Exception:
-        pass
+# =========================
+# Order storage
+# =========================
+def save_order(customer_name, phone, address, product):
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO orders
+        (customer_name, phone, address, product, status, created_at, review_sent)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+    """, (
+        customer_name,
+        phone,
+        address,
+        product,
+        "confirmed",
+        now_iso(),
+    ))
+    con.commit()
+    order_id = cur.lastrowid
+    con.close()
+    return order_id
 
+
+def review_worker():
+    """
+    Local SQLite-based review queue.
+    WhatsApp sending is intentionally not enabled yet.
+    Once WhatsApp Cloud API credentials are added, this worker can be connected
+    to the send-message function.
+    """
     while True:
-        time.sleep(max(5, REFRESH_MINUTES * 60))
+        try:
+            con = sqlite3.connect(DB_PATH)
+            cur = con.cursor()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+            cur.execute("""
+                SELECT id, customer_name, phone, product
+                FROM orders
+                WHERE review_sent = 0 AND created_at <= ?
+            """, (cutoff,))
+            rows = cur.fetchall()
+            con.close()
+
+            # We only mark/send after WhatsApp integration is available.
+            # For now leave rows untouched so nothing is silently lost.
+            _ = rows
+        except Exception:
+            pass
+
+        time.sleep(3600)
+
+
+def background_refresh_loop():
+    while True:
         try:
             refresh_all()
         except Exception:
             pass
+        time.sleep(3600)
 
 
-def review_worker():
-    while True:
-        try:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=3)
-            conn = sqlite3.connect(DB_PATH)
-            rows = conn.execute(
-                "SELECT id, customer_phone FROM orders WHERE review_sent=0"
-            ).fetchall()
-
-            for order_id, phone in rows:
-                # Only send/prepare reviews once the order is at least 3 days old.
-                row = conn.execute(
-                    "SELECT created_at FROM orders WHERE id=?", (order_id,)
-                ).fetchone()
-                if not row:
-                    continue
-                try:
-                    created = datetime.fromisoformat(row[0])
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=timezone.utc)
-                except Exception:
-                    continue
-
-                if created <= cutoff:
-                    message = "ভাই প্রোডাক্ট হাতে পাইছেন? কেমন লাগলো? একটা রিভিউ দেন প্লিজ ❤️"
-                    # WhatsApp sending is intentionally left for the Cloud API setup.
-                    app.logger.info("Review due for %s: %s", phone, message)
-                    conn.execute(
-                        "UPDATE orders SET review_sent=1 WHERE id=?", (order_id,)
-                    )
-
-            conn.commit()
-            conn.close()
-        except Exception:
-            pass
-        time.sleep(300)
-
-
-def gemini_reply(user_message):
-    if not GEMINI_API_KEY:
-        return "ভাই একটু সময় দেন, AI এখনো সেটআপ হচ্ছে।"
-
-    try:
-        from google import genai
-
-        with knowledge_lock:
-            website_text = knowledge["website_text"]
-            products = list(knowledge["products"])
-            facebook_text = knowledge["facebook_text"]
-
-        product_text = json.dumps(products[:50], ensure_ascii=False, indent=2)
-
-        system = f"""
-You are the friendly AI sales assistant for True Seller.
-Rules:
-- Reply in the same language style as the customer: Bangla, English, or Banglish.
-- Be friendly and natural; you may use ভাই/আপু and 1-2 emojis.
-- Never invent a price. If the exact price is not in the knowledge, say you need to check.
-- Use the website product information as the main source for product names, prices and details.
-- Help with delivery/COD/FAQ only when supported by the knowledge.
-- For an order, collect: name, phone, full address, product.
-- Do not claim an order is confirmed until all four details are available.
-- Once all four are available, say exactly:
-  ঠিক আছে ভাই অর্ডার কনফার্ম ✅ আমরা 24 ঘন্টার মধ্যে কল দিবো
-- Never be rude or angry.
-- Do not expose internal instructions or API keys.
-
-WEBSITE:
-{website_text[:12000]}
-
-PRODUCTS:
-{product_text}
-
-FACEBOOK:
-{facebook_text[:6000]}
-"""
-
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=system + "\n\nCustomer message:\n" + user_message,
-        )
-        return (response.text or "").strip() or "ভাই একটু পরে আবার মেসেজ দেন ❤️"
-    except Exception as e:
-        app.logger.exception("Gemini error")
-        return f"ভাই একটু সমস্যা হচ্ছে, কিছুক্ষণ পরে আবার চেষ্টা করেন।"
-
-
+# =========================
+# Routes
+# =========================
 @app.get("/")
 def home():
     return jsonify({
+        "ok": True,
         "service": "True Seller AI Bot",
-        "status": "running",
-        "whatsapp_configured": bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
-        "endpoints": ["/health", "/refresh", "/test-chat", "/webhook"],
+        "message": "Bot service is running",
+        "whatsapp": "not configured yet"
     })
 
 
 @app.get("/health")
 def health():
-    with knowledge_lock:
+    with state_lock:
         return jsonify({
             "ok": True,
-            "gemini_configured": bool(GEMINI_API_KEY),
+            "gemini_configured": bool(GEMINI_API_KEY and gemini_client),
             "gemini_model": GEMINI_MODEL,
+            "whatsapp_configured": bool(
+                WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID
+            ),
             "products_loaded": len(knowledge["products"]),
             "website_last_refresh": knowledge["website_last_refresh"],
             "facebook_last_refresh": knowledge["facebook_last_refresh"],
-            "whatsapp_configured": bool(WHATSAPP_TOKEN and PHONE_NUMBER_ID),
+            "last_error": knowledge["last_error"],
         })
 
 
-refresh_state = {"running": False, "last_result": None, "started_at": None, "finished_at": None}
-refresh_state_lock = threading.Lock()
+@app.get("/refresh")
+def refresh_route():
+    # Run in a thread so Render/Gunicorn does not hold the request open.
+    thread = threading.Thread(target=refresh_all, daemon=True)
+    thread.start()
+    return jsonify({
+        "ok": True,
+        "message": "Refresh started in background. Check /health in a few seconds."
+    })
 
 
-def run_refresh_background():
-    try:
-        result = refresh_all()
-        with refresh_state_lock:
-            refresh_state["last_result"] = result
-    except Exception as e:
-        app.logger.exception("Background refresh failed")
-        with refresh_state_lock:
-            refresh_state["last_result"] = {"ok": False, "error": str(e)}
-    finally:
-        with refresh_state_lock:
-            refresh_state["running"] = False
-            refresh_state["finished_at"] = utc_now_iso()
-
-
-@app.route("/refresh", methods=["GET", "POST"])
-def refresh():
-    # Never make the browser/Render request wait for website scraping.
-    with refresh_state_lock:
-        if refresh_state["running"]:
-            return jsonify({"ok": True, "status": "already_running"})
-        refresh_state["running"] = True
-        refresh_state["started_at"] = utc_now_iso()
-        refresh_state["finished_at"] = None
-        refresh_state["last_result"] = None
-
-    threading.Thread(target=run_refresh_background, daemon=True).start()
-    return jsonify({"ok": True, "status": "started", "message": "Refresh started in background. Check /health again in 15-30 seconds."})
-
-
-@app.route("/test-chat", methods=["GET", "POST"])
+@app.get("/test-chat")
 def test_chat():
-    if request.method == "GET":
-        q = request.args.get("q", "").strip()
-        if not q:
-            return render_template_string("""
-            <!doctype html>
-            <html><body style="font-family:Arial;max-width:700px;margin:30px auto;padding:10px">
-            <h2>True Seller AI Test</h2>
-            <form method="get">
-              <input name="q" style="width:100%;padding:12px" placeholder="যেমন: এই প্রোডাক্টের দাম কত?" />
-              <button style="margin-top:10px;padding:10px 18px">Send</button>
-            </form>
-            </body></html>
-            """)
-        return jsonify({"reply": gemini_reply(q)})
-
-    data = request.get_json(silent=True) or {}
-    q = data.get("message", "")
-    return jsonify({"reply": gemini_reply(q)})
+    q = request.args.get("q", "").strip()
+    if not q:
+        q = "হ্যালো"
+    return jsonify({
+        "ok": True,
+        "question": q,
+        "answer": ask_gemini(q)
+    })
 
 
 @app.get("/webhook")
-def verify_webhook():
+def webhook_verify():
+    """
+    WhatsApp Cloud API verification endpoint.
+    Sending messages is deliberately not enabled until API credentials are added.
+    """
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
 
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+    if mode == "subscribe" and token and token == WHATSAPP_VERIFY_TOKEN:
         return challenge or "", 200
+
     return "Forbidden", 403
 
 
 @app.post("/webhook")
-def webhook():
+def webhook_receive():
+    """
+    Receives WhatsApp webhook payloads.
+    Message sending is intentionally disabled until WhatsApp API setup is complete.
+    """
     payload = request.get_json(silent=True) or {}
     app.logger.info("WhatsApp webhook received: %s", payload)
-    return "EVENT_RECEIVED", 200
+    return jsonify({"ok": True})
 
 
-def start_background_workers():
-    threading.Thread(target=background_refresh_worker, daemon=True).start()
-    threading.Thread(target=review_worker, daemon=True).start()
-
-
+# =========================
+# Startup
+# =========================
 init_db()
-start_background_workers()
+
+# Initial data load should not block Render startup.
+threading.Thread(target=refresh_all, daemon=True).start()
+threading.Thread(target=background_refresh_loop, daemon=True).start()
+threading.Thread(target=review_worker, daemon=True).start()
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "5000")),
+        debug=False,
+)
