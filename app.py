@@ -206,7 +206,8 @@ def refresh_products():
         return len(products)
     except Exception as e:
         with state_lock:
-            knowledge["last_error"] = f"Firebase product load error: {e}"
+            knowledge["last_error"] = f"Firebase product load error: {type(e).__name__}: {e}"
+        app.logger.error("Firebase product load failed: %s", e)
         return 0
 
 
@@ -407,6 +408,35 @@ def health():
             "facebook_last_refresh": knowledge["facebook_last_refresh"],
             "last_error": knowledge["last_error"],
         })
+
+
+@app.get("/firebase-test")
+def firebase_test():
+    """Safe diagnostic for the public Firebase products endpoint."""
+    url = f"{FIREBASE_DATABASE_URL}/products.json"
+    try:
+        r = requests.get(url, timeout=(5, 15))
+        preview = r.text[:300].replace("\n", " ")
+        count = 0
+        if r.ok:
+            data = r.json() or {}
+            if isinstance(data, dict):
+                count = len(data)
+            elif isinstance(data, list):
+                count = len(data)
+        return jsonify({
+            "ok": r.ok,
+            "firebase_url": url,
+            "http_status": r.status_code,
+            "products_found": count,
+            "response_preview": preview,
+        }), (200 if r.ok else 502)
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "firebase_url": url,
+            "error": f"{type(e).__name__}: {e}",
+        }), 502
 
 
 @app.get("/refresh")
