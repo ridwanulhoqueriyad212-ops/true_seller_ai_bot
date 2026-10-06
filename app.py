@@ -196,17 +196,24 @@ def load_products_from_firebase():
 
 
 def refresh_products():
+    """Load live products from Firebase and update the in-memory knowledge."""
     try:
-        products, text = load_products_from_firebase()
+        products, catalog_text = load_products_from_firebase()
+
         with state_lock:
             knowledge["products"] = products
-            knowledge["website_text"] = text
+            knowledge["website_text"] = catalog_text
             knowledge["website_last_refresh"] = now_iso()
             knowledge["last_error"] = None
+
+        app.logger.info("Firebase products loaded successfully: %s", len(products))
         return len(products)
+
     except Exception as e:
+        error = f"Firebase product load error: {type(e).__name__}: {e}"
         with state_lock:
-            knowledge["last_error"] = f"Firebase product load error: {e}"
+            knowledge["last_error"] = error
+        app.logger.exception("Firebase product load failed")
         return 0
 
 
@@ -394,28 +401,40 @@ def home():
 
 @app.get("/health")
 def health():
-    # If the background refresh has not populated products yet, load them
-    # synchronously once. This avoids reporting 0 after a successful Firebase
-    # connection just because the background thread has not completed.
-    with state_lock:
-        needs_products = len(knowledge["products"]) == 0
+    live_count = 0
+    live_error = None
 
-    if needs_products:
-        refresh_products()
+    try:
+        products, catalog_text = load_products_from_firebase()
+        live_count = len(products)
+
+        with state_lock:
+            knowledge["products"] = products
+            knowledge["website_text"] = catalog_text
+            knowledge["website_last_refresh"] = now_iso()
+            knowledge["last_error"] = None
+    except Exception as e:
+        live_error = f"{type(e).__name__}: {e}"
+        with state_lock:
+            knowledge["last_error"] = f"Firebase product load error: {live_error}"
+        app.logger.exception("Health Firebase check failed")
 
     with state_lock:
-        return jsonify({
-            "ok": True,
-            "gemini_configured": bool(GEMINI_API_KEY and gemini_client),
-            "gemini_model": GEMINI_MODEL,
-            "whatsapp_configured": bool(
-                WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID
-            ),
-            "products_loaded": len(knowledge["products"]),
-            "website_last_refresh": knowledge["website_last_refresh"],
-            "facebook_last_refresh": knowledge["facebook_last_refresh"],
-            "last_error": knowledge["last_error"],
-        })
+        last_error = knowledge["last_error"]
+
+    return jsonify({
+        "ok": True,
+        "gemini_configured": bool(GEMINI_API_KEY and gemini_client),
+        "gemini_model": GEMINI_MODEL,
+        "whatsapp_configured": bool(
+            WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID
+        ),
+        "products_loaded": live_count,
+        "website_last_refresh": knowledge["website_last_refresh"],
+        "facebook_last_refresh": knowledge["facebook_last_refresh"],
+        "last_error": last_error,
+        "firebase_live_check": live_count > 0,
+    })
 
 
 @app.get("/refresh")
@@ -431,20 +450,18 @@ def refresh_route():
 
 @app.get("/test-chat")
 def test_chat():
-    q = request.args.get("q", "").strip()
-    if not q:
-        q = "হ্যালো"
+    q = request.args.get("q", "").strip() or "হ্যালো"
+
+    # Always ensure this request has the current live catalog.
+    refresh_products()
 
     with state_lock:
-        needs_products = len(knowledge["products"]) == 0
-
-    if needs_products:
-        refresh_products()
+        count = len(knowledge["products"])
 
     return jsonify({
         "ok": True,
         "question": q,
-        "products_loaded": len(knowledge["products"]),
+        "products_loaded": count,
         "answer": ask_gemini(q)
     })
 
@@ -481,8 +498,7 @@ def webhook_receive():
 # =========================
 init_db()
 
-# Initial data load should not block Render startup.
-threading.Thread(target=refresh_all, daemon=True).start()
+# Background hourly refresh. Live endpoints also refresh when needed.
 threading.Thread(target=background_refresh_loop, daemon=True).start()
 threading.Thread(target=review_worker, daemon=True).start()
 
