@@ -3,6 +3,7 @@ import json
 import sqlite3
 import threading
 import time
+import threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
@@ -74,7 +75,7 @@ def scrape_website():
     headers = {
         "User-Agent": "Mozilla/5.0 (compatible; TrueSellerBot/1.0)"
     }
-    r = requests.get(WEBSITE_URL, headers=headers, timeout=25)
+    r = requests.get(WEBSITE_URL, headers=headers, timeout=(5, 10))
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
@@ -337,11 +338,38 @@ def health():
         })
 
 
+refresh_state = {"running": False, "last_result": None, "started_at": None, "finished_at": None}
+refresh_state_lock = threading.Lock()
+
+
+def run_refresh_background():
+    try:
+        result = refresh_all()
+        with refresh_state_lock:
+            refresh_state["last_result"] = result
+    except Exception as e:
+        app.logger.exception("Background refresh failed")
+        with refresh_state_lock:
+            refresh_state["last_result"] = {"ok": False, "error": str(e)}
+    finally:
+        with refresh_state_lock:
+            refresh_state["running"] = False
+            refresh_state["finished_at"] = utc_now_iso()
+
+
 @app.route("/refresh", methods=["GET", "POST"])
 def refresh():
-    # Kept simple so the user can verify a refresh from a browser.
-    result = refresh_all()
-    return jsonify(result)
+    # Never make the browser/Render request wait for website scraping.
+    with refresh_state_lock:
+        if refresh_state["running"]:
+            return jsonify({"ok": True, "status": "already_running"})
+        refresh_state["running"] = True
+        refresh_state["started_at"] = utc_now_iso()
+        refresh_state["finished_at"] = None
+        refresh_state["last_result"] = None
+
+    threading.Thread(target=run_refresh_background, daemon=True).start()
+    return jsonify({"ok": True, "status": "started", "message": "Refresh started in background. Check /health again in 15-30 seconds."})
 
 
 @app.route("/test-chat", methods=["GET", "POST"])
